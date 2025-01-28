@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>VK groups</title>
+
+ 	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.3.0/dist/MarkerCluster.css" />
+	<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.3.0/dist/MarkerCluster.Default.css" />
+
+	<script src="https://unpkg.com/leaflet@1.3.1/dist/leaflet.js" integrity="sha512-/Nsx9X4HebavoBvEBuyp3I7od5tA0UzAxs+j83KgC8PU0kgB4XiK4Lfe4y4cgBtaRJQEIFCW+oC506aPT2L1zw==" crossorigin=""></script>
+  	<script src="https://unpkg.com/leaflet.markercluster@1.3.0/dist/leaflet.markercluster.js"></script>
+
+	<script>
+		let vkapiCounter = 0;
+		let vkapiToken = "";
+		var map;
+
+		function loadAvatar(id){
+			vkapi(`users.get?user_ids=${id}&fields=photo_400_orig`).then(res => {
+				document.getElementById(`avatar_${id}`).src = res.response[0].photo_400_orig;
+			});
+		}
+
+		function vkapi(method){
+			return new Promise(resolve => {
+				let callbackName = `callbackFunc${vkapiCounter++}`
+				window[callbackName] = e => {
+					delete window[callbackName];
+					resolve(e);
+				};
+
+				var script = document.createElement('SCRIPT');
+				script.src = `https://api.vk.com/method/${method}&access_token=${vkapiToken}&v=5.199&callback=${callbackName}`;
+				document.getElementsByTagName("head")[0].appendChild(script);
+			}); 
+		}
+
+		async function getAllMembers(groupId, progress){
+			let usersCountResponse = await vkapi(`groups.getMembers?group_id=${groupId}&count=0`);
+			console.log(usersCountResponse);
+			let usersCount = usersCountResponse.response.count;
+
+			let users = [];
+			let userCount = 0;
+			
+			while(users.length < usersCount){
+				let startTime = Date.now();
+				let newUsers = await vkapi(`groups.getMembers?group_id=${groupId}&count=1000&offset=${users.length}&fields=city`);
+				users = users.concat(newUsers.response.items);
+				console.log(newUsers);
+
+				await new Promise(r => setTimeout(r, (1000 / 4) - (Date.now() - startTime)));
+				progress(users.length / usersCount);
+			}
+			return users;
+		}
+
+		async function getAllCitiesUUID(cities, progress){
+
+			let infos = [];
+			
+			while(infos.length < cities.length){
+				let startTime = Date.now();
+				let newInfos = await vkapi(`database.getCitiesById?city_ids=${cities.slice(infos.length, infos.length+1000).join(",")}&fields=fias_guid`);
+				infos = infos.concat(newInfos.response);
+				console.log(newInfos);
+
+				await new Promise(r => setTimeout(r, (1000 / 4) - (Date.now() - startTime)));
+				progress(infos.length / cities.length);
+			}
+			return infos;
+		}
+
+		function actionAuthCompleted(){
+			document.getElementById("auth").style.display = "none";
+			document.getElementById("group_id").style.display = "";
+		}
+
+		function actionLaunch(){
+			document.getElementById("group_id").style.display = "none";
+			document.getElementById("progress").style.display = "";
+			new Promise(e => doWork());
+		}
+
+		function actionShowMap(){
+			document.getElementById("dimming").style.display = "none";
+			document.getElementById("map").style.zIndex = "auto";
+		}
+
+		async function doWork(){
+			let groupId = document.getElementById("group_id_input").value;
+			let membersProgress = document.getElementById("members_progress");
+			let dbProgress = document.getElementById("db_progress");
+			let citiesProgress = document.getElementById("cities_progress");
+
+			let members = await getAllMembers(groupId, percent => {
+				membersProgress.value = percent * 100;
+			});
+			members = members.filter((value, index, array) => Object.hasOwn(value, "city"));
+			
+			let db = await (await fetch("RussianOikonymsDatasetFiasGuid.tsv")).text();
+			db = Object.fromEntries(db.split('\n').map(line => {
+				let parts = line.split("\t");
+				let lastIndex = parts.length - 1;
+				return [parts[lastIndex], {lon: parseFloat(parts[lastIndex - 4]), lat: parseFloat(parts[lastIndex - 3])}];
+			}));
+			dbProgress.value = 100;
+
+			console.log(db);
+
+			let cityIds = members.map(entry => entry.city.id)
+				.filter((value, index, array) => array.indexOf(value) === index);
+
+			let citiesUUIDs = await getAllCitiesUUID(cityIds, percent => {
+				citiesProgress.value = percent * 100;
+			});
+			citiesUUIDs = citiesUUIDs.filter((value, index, array) => Object.hasOwn(value, "fias_guid"));
+
+			let idToCoord = Object.fromEntries(citiesUUIDs.map(element => [element.id, db[element.fias_guid]]));
+			
+
+			var markers = L.markerClusterGroup();
+			members.forEach(member => {
+				let coords = idToCoord[member.city.id];
+				if(coords == undefined || isNaN(coords.lat) || isNaN(coords.lon))
+					return;
+
+				var content = L.DomUtil.create('div', ``);
+				content.innerHTML = `
+					<img id="avatar_${member.id}" width="100" height="100">
+					<br>
+					${member.first_name} ${member.last_name}
+					<br>
+					<a href="https://vk.com/id${member.id}" target="_blank">Открыть</a>
+				`;
+
+				L.DomEvent.addListener(content, 'click', function(event){
+					console.log(`load avatar for: ${member.id}`);
+				    loadAvatar(member.id)
+				}, map);
+
+				let marker = L.marker(new L.LatLng(coords.lat, coords.lon))
+					.bindPopup(content)
+				content.markerId = member.id;
+
+				markers.addLayer(marker);
+			});
+			map.addLayer(markers);
+
+			console.log(idToCoord);
+			actionShowMap();
+		}
+	</script>
+
+	<style type="text/css">
+		* {
+			padding: 0;
+			margin: 0;
+			font-family: arial;
+		}
+
+		#map {
+			position: absolute;
+			width: 100%;
+			height: 100%;
+			z-index: -1;
+		}
+
+		html, body {
+			height: 100%;
+		}
+		
+		#dimming {
+			height: 100%;
+			width: 100%;
+			display: flex;
+			justify-content: center;
+		    align-items: center;
+
+		    background: rgba(0, 0, 0, 70%);
+		}
+
+		#panel {
+			width: 300px;
+			background: rgb(255 255 255 / 100%);
+			padding: 20px;
+			margin: 10px;
+			border-radius: 10px;
+			
+			box-sizing: border-box;
+		}
+
+		#group_id {
+			display: flex;
+    		gap: 2px;
+    		flex-wrap: wrap;
+		}
+
+		#group_id_input {
+		    width: 150px;
+		}
+
+		.button {
+			padding: 8px;
+			background: #07f;
+			border-radius: 8px;
+			display: flex;
+			justify-content: center;
+		    align-items: center;
+		    color: white;
+		    width: 100%;
+
+		    cursor: pointer;
+		}
+
+		progress {
+			width: 100%;
+		}
+	</style>
+</head>
+
+
+<body>
+	<div id="map" onload="onInit()"></div>
+	<script>
+		map = L.map('map').setView([59.939097723000032, 30.315875515000073], 4);
+		L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+		    maxZoom: 19,
+		    attribution: '&copy; <a href="http://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+		}).addTo(map);
+
+		map.on('popupopen', e => {
+			loadAvatar(e.popup._source._popup._content.markerId);
+		});
+		
+	</script>
+
+	<div id="dimming">
+		<div id="panel">
+			<div id="group_id" style="display: none;">
+				https://vk.com/
+				<input type="text" id="group_id_input">
+				<br>
+				<div class="button" onclick="actionLaunch()">Начать</div>
+			</div>
+			<div id="progress" style="display: none;">
+				<label for="members_progress">Участники:</label>
+				<progress id="members_progress" max="100" value="0"></progress>
+				<br>
+				<br>
+				<label for="db_progress">База данных городов:</label>
+				<progress id="db_progress" max="100" value="0"></progress>
+				<br>
+				<br>
+				<label for="cities_progress">Города участников:</label>
+				<progress id="cities_progress" max="100" value="0"></progress>
+			</div>
+			<div id="auth">
+				<script src="https://unpkg.com/@vkid/sdk@<3.0.0/dist-sdk/umd/index.js"></script>
+				<script type="text/javascript">
+					if ('VKIDSDK' in window) {
+						const VKID = window.VKIDSDK;
+
+						let url = window.location.href;
+						url = url.replace("http://", "https://");
+						if(url.endsWith("/"))
+							url = url.substr(0, url.length-1);
+
+						VKID.Config.init({
+							app: 52970355,
+							redirectUrl: url,
+							responseMode: VKID.ConfigResponseMode.Callback,
+							source: VKID.ConfigSource.LOWCODE,
+							scope: '', // Заполните нужными доступами по необходимости
+						});
+
+						const oneTap = new VKID.OneTap();
+
+						oneTap.render({
+							container: document.currentScript.parentElement,
+							showAlternativeLogin: true
+						})
+						.on(VKID.WidgetEvents.ERROR, vkidOnError)
+						.on(VKID.OneTapInternalEvents.LOGIN_SUCCESS, function (payload) {
+							const code = payload.code;
+							const deviceId = payload.device_id;
+
+							VKID.Auth.exchangeCode(code, deviceId)
+								.then(vkidOnSuccess)
+								.catch(vkidOnError);
+						});
+
+						function vkidOnSuccess(data) {
+							console.log(data);
+							vkapiToken = data.access_token;
+
+							actionAuthCompleted();
+						}
+
+						function vkidOnError(error) {
+							// Обработка ошибки
+						}
+					}
+				</script>
+			</div>
+		</div>
+	</div>
+</body>
+</html>
